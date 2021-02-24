@@ -1071,13 +1071,13 @@ sqlite3 *dbInit(int createdb) {
     "CREATE INDEX IF NOT EXISTS idx_liststock_ls ON ListStock(listid,symbol);"
 
     "CREATE TABLE IF NOT EXISTS StockPack(liststockid INT, "
-                                          "quantity INT, "
+                                          "quantity REAL, "
                                           "avgprice REAL);"
     "CREATE INDEX IF NOT EXISTS idx_stockpack_lsid ON StockPack(liststockid);"
     "CREATE TABLE IF NOT EXISTS ProfitLoss(symbol TEXT COLLATE NOCASE, "
                                           "listid INT, "
                                           "selltime INT, "
-                                          "quantity INT, "
+                                          "quantity REAL, "
                                           "buyprice REAL,"
                                           "sellprice REAL,"
                                           "csym TEXT);" /* Currency symbol. */
@@ -1177,7 +1177,7 @@ int dbDelStockFromList(const char *listname, const char *symbol, int dellist) {
 typedef struct stockpack {
     int64_t rowid;
     int64_t stockid;
-    int64_t quantity;
+    double quantity;
     double avgprice;
     /* Only filled by dbGetPortfolio. */
     int currency;
@@ -1241,7 +1241,7 @@ stockpack *dbGetPortfolio(const char *listname, int *count) {
         stockpack *pack = packs+rows;
         memset(pack,0,sizeof(stockpack));
         const char *symbol = row.col[0].s;
-        pack->quantity = row.col[1].i;
+        pack->quantity = row.col[1].d;
         pack->avgprice = row.col[2].d;
         /* Compute the gain. */
         populateStockPackInfo(pack,symbol);
@@ -1307,7 +1307,7 @@ int dbGetStockPack(stockpack *sp) {
     /* Check if a list with such name already exists. */
     if (sqlNextRow(&row)) {
         sp->rowid = row.col[0].i;
-        sp->quantity = row.col[1].i;
+        sp->quantity = row.col[1].d;
         sp->avgprice = row.col[2].d;
         sqlEnd(&row);
         return C_OK;
@@ -1329,11 +1329,11 @@ int dbGetStockPack(stockpack *sp) {
 int dbUpdateStockPack(stockpack *sp) {
     if (sp->rowid == 0) {
         sp->rowid = sqlInsert(
-            "INSERT INTO StockPack VALUES(?i,?i,?d)",
+            "INSERT INTO StockPack VALUES(?i,?d,?d)",
             sp->stockid, sp->quantity, sp->avgprice);
         return sp->rowid == 0 ? C_ERR : C_OK;
     } else if (sp->quantity > 0) {
-        int done = sqlQuery("UPDATE StockPack SET quantity=?i,avgprice=?d "
+        int done = sqlQuery("UPDATE StockPack SET quantity=?d,avgprice=?d "
                              "WHERE rowid=?i",
                              sp->quantity,sp->avgprice,sp->rowid);
         return done ? C_OK : C_ERR;
@@ -1355,7 +1355,7 @@ int dbUpdateStockPack(stockpack *sp) {
  * filling 'spp' if not NULL.
  *
  * On success C_OK is returned, on error C_ERR. */
-int dbBuyStocks(const char *listname, const char *symbol, double price, int quantity, stockpack *spp) {
+int dbBuyStocks(const char *listname, const char *symbol, double price, double quantity, stockpack *spp) {
     /* Sanity check. */
     if (quantity <= 0) return C_ERR;
 
@@ -1394,7 +1394,7 @@ int dbBuyStocks(const char *listname, const char *symbol, double price, int quan
  *
  * On success the *ssp structure is filled with the condition of the stock
  * *after* the selling. */
-int dbSellStocks(const char *listname, const char *symbol, int quantity, double sellprice, const char *csym, stockpack *sp) {
+int dbSellStocks(const char *listname, const char *symbol, double quantity, double sellprice, const char *csym, stockpack *sp) {
     /* Sanity check. */
     if (quantity < 0) return C_ERR;
 
@@ -1423,7 +1423,7 @@ int dbSellStocks(const char *listname, const char *symbol, int quantity, double 
     /* Create a profit and loss entry with this selling. */
     int64_t listid = dbGetListID(listname,0);
     if (listid) {
-        sqlInsert("INSERT INTO ProfitLoss VALUES(?s,?i,?i,?i,?d,?d,?s)",
+        sqlInsert("INSERT INTO ProfitLoss VALUES(?s,?i,?i,?d,?d,?d,?s)",
             symbol, listid, (int64_t)time(NULL), quantity, sp->avgprice,
             sellprice, csym);
     }
@@ -1956,12 +1956,12 @@ cleanup:
 /* Parse a string in the format <quantity> or <quantity>@<price> for
  * stock selling / buying subcommands. Populate the parameters by
  * reference. */
-void parseQuantityAndPrice(const char *str, int64_t *quantity, double *price) {
+void parseQuantityAndPrice(const char *str, double *quantity, double *price) {
     /* Parse the quantity@price argument if available. */
     sds copy = sdsnew(str);
     char *p = strchr(copy,'@');
     if (p) *price = strtod(p+1,NULL);
-    *quantity = strtoll(copy,NULL,10);
+    *quantity = strtod(copy,&p);
     sdsfree(copy);
 }
 
@@ -2014,7 +2014,7 @@ void botHandleListRequest(botRequest *br, sds *argv, int argc) {
         sdsfreesplitres(stocks,numstocks);
     } else if (!strcasecmp(argv[1],"buy") && (argc == 3 || argc == 4)) {
         /* $list: buy SYMBOL [100@price] */
-        int64_t quantity = 1;
+        double quantity = 1;
         double price = 0;
         sds symbol = argv[2];
 
@@ -2036,8 +2036,8 @@ void botHandleListRequest(botRequest *br, sds *argv, int argc) {
             reply = sdsnew("Error adding the stock pack.");
         } else {
             reply = sdscatprintf(sdsempty(),
-                "Now you have %d %s stocks at an average price of %.2f.",
-                (int)sp.quantity,symbol,sp.avgprice);
+                "Now you have %.2f %s stocks at an average price of %.2f.",
+                sp.quantity,symbol,sp.avgprice);
         }
     } else if (!strcasecmp(argv[1],"rm-sell") && argc == 3) {
         int64_t id = strtoll(argv[2],NULL,10);
@@ -2051,7 +2051,7 @@ void botHandleListRequest(botRequest *br, sds *argv, int argc) {
         }
     } else if (!strcasecmp(argv[1],"sell") && (argc == 3 || argc == 4)) {
         /* $list: sell [quantity] */
-        int64_t quantity = 0; /* All the stocks. */
+        double quantity = 0; /* All the stocks. */
         sds symbol = argv[2];
         double sellprice = 0;
 
@@ -2077,9 +2077,9 @@ void botHandleListRequest(botRequest *br, sds *argv, int argc) {
         } else {
             if (sp.quantity != 0) {
                 reply = sdscatprintf(sdsempty(),
-                    "You are left with %d %s stocks at an average "
+                    "You are left with %.2f %s stocks at an average "
                     "price of %.2f.",
-                    (int)sp.quantity,symbol,sp.avgprice);
+                    sp.quantity,symbol,sp.avgprice);
             } else {
                 reply = sdscatprintf(sdsempty(),
                     "You no longer own %s stocks.",symbol);
@@ -2184,11 +2184,11 @@ void botHandleShowPortfolioRequest(botRequest *br, int argc, sds *argv) {
         } while(gp >= 10);
 
         reply = sdscatprintf(reply,
-            "%-7s %d@%.2f = %.0f\n"
+            "%-7s %.4f@%.4ff = %.2f\n"
             "       %s%.2f (%s%.2f%%) %s\n"
             "       %s%.2f (%s%.2f%%) today\n\n",
             pack->symbol,
-            (int)pack->quantity,
+            pack->quantity,
             pack->avgprice,
             pack->avgprice * pack->quantity,
             (pack->gain >= 0) ? "+" : "",
@@ -2291,7 +2291,7 @@ void botHandleShowProfitLossRequest(botRequest *br, int argc, sds *argv) {
 
         int64_t id = row.col[0].i;
         time_t selltime = row.col[3].i;
-        int quantity = row.col[4].i;
+        int quantity = row.col[4].d;
         double buyprice = row.col[5].d;
         double sellprice = row.col[6].d;
         double diff = (sellprice-buyprice)*quantity;
